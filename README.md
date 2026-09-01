@@ -3,30 +3,29 @@
 **Time-Series Foundation Model inference on Apple Silicon**, built on top of
 [`mlx`](https://github.com/ml-explore/mlx) and [`mlx-lm`](https://github.com/ml-explore/mlx-lm).
 
-`mlx-tsfm` is a model-agnostic inference layer for time-series foundation models (TSFMs) —
-TimesFM, Chronos-2, Moirai — on M-series Macs. It reuses `mlx-lm`'s quantization, LoRA/adapter,
-and `mx.compile` machinery, and adds the parts a *forecaster* needs that an LLM stack does not:
-a patch front-end, per-series instance normalization, and point + quantile regression heads
-(instead of a token softmax).
+`mlx-tsfm` is a model-agnostic inference layer for time-series foundation models (TSFMs) on M-series
+Macs. It ships an **MLX-native port of [TimesFM 3.0](https://huggingface.co/google/timesfm-3.0-pytorch)**
+— numerically verified against the PyTorch reference (max abs error **2.1e-6**, float32 noise) — plus
+the parts a *forecaster* needs that an LLM stack does not: a patch front-end, per-series instance
+normalization (RevIN), and point + quantile regression heads instead of a token softmax.
 
-> Status: **early** (`0.0.x`). The model-agnostic core + a runnable reference (`toy`) backend
-> work today and are covered by tests. The real weight-loading backends (TimesFM, Chronos-2) are
-> in progress — see [Roadmap](#roadmap).
+> Status: **early** (`0.0.x`). TimesFM 3.0 loads real weights and runs on MLX with verified parity.
+> Chronos-2 and `mx.compile` are next — see [Roadmap](#roadmap).
 
 ## Why a separate package (not `mlx-lm`)
 
 `mlx-lm` is for autoregressive **language** models: tokenizer in, vocab-softmax out, sampled decode
 loop. A TSFM is **non-autoregressive numeric regression**: patches in, point + quantile bands out,
 single forward pass. `mlx_lm.convert` assumes a token-embedding + softmax model and does not apply.
-`mlx-tsfm` follows the community `mlx-<domain>` convention (`mlx-vlm`, `mlx-audio`) and depends on
-`mlx-lm` for the pieces that *are* shared.
+`mlx-tsfm` follows the community `mlx-<domain>` convention (`mlx-vlm`, `mlx-audio`) and reuses
+`mlx-lm` for what *is* shared (quantization, LoRA/adapters, `mx.compile`).
 
 ## Install
 
 ```bash
 uv venv && uv pip install -e .          # inference (mlx, mlx-lm, numpy)
-uv pip install -e '.[torch]'            # + weight conversion from PyTorch checkpoints
-uv pip install -e '.[dev]'              # + pytest, pre-commit
+uv pip install -e '.[torch]'            # + weight conversion / numeric-parity oracle (torch)
+uv pip install -e '.[dev]'              # + pytest
 ```
 
 Requires Apple Silicon (arm64 macOS) — MLX does not run on Intel Macs.
@@ -37,72 +36,68 @@ Requires Apple Silicon (arm64 macOS) — MLX does not run on Intel Macs.
 import numpy as np
 from mlx_tsfm import load
 
-model = load("toy", horizon_max=64)          # runnable reference backend, random weights
-ctx = np.sin(np.linspace(0, 20, 256))         # a 1-D context series
-fc = model.forecast(ctx, horizon=24, quantiles=[0.1, 0.5, 0.9])
-print(fc.point.shape)       # (1, 24)         point forecast
-print(fc.quantiles.shape)   # (1, 24, 3)      probabilistic band
+model = load("timesfm-3.0")                    # downloads 1.3GB on first use (research license)
+ctx = np.sin(np.linspace(0, 40, 512))          # a 1-D context series
+fc = model.forecast(ctx, horizon=64, quantiles=[0.1, 0.5, 0.9])
+print(fc.point.shape)       # (1, 64)          median forecast
+print(fc.quantiles.shape)   # (1, 64, 3)       probabilistic band
 ```
 
-Batch many series through the single non-autoregressive forward pass (the #1 optimization):
+Batch many series through the single non-autoregressive forward pass:
 
 ```python
 contexts = np.stack([series1, series2, series3])   # (B, L)
-fc = model.forecast_batch(contexts, horizon=24)    # fc.point: (B, 24)
+fc = model.forecast_batch(contexts, horizon=64)    # fc.point: (B, 64)
 ```
 
 ## CLI
 
 ```bash
-mlx_tsfm.forecast --model toy --input series.npy --horizon 24 --quantiles 0.1,0.5,0.9
-mlx_tsfm.bench    --model toy --context 512 --horizon 64 --batch 1,8,32 --json
-# (in progress) mlx_tsfm.convert  --hf amazon/chronos-2 --out models/chronos-2-mlx
-# (in progress) mlx_tsfm.quantize --model models/chronos-2-mlx --bits 8 --group-size 64
+mlx_tsfm.forecast --model timesfm-3.0 --input series.npy --horizon 64 --quantiles 0.1,0.5,0.9
+mlx_tsfm.bench    --model timesfm-3.0 --context 512 --horizon 64 --batch 1,8,32 [--quantize int8]
+mlx_tsfm.convert  --hf google/timesfm-3.0-pytorch --out models/timesfm-3.0-mlx --dtype bf16
 ```
+
+## Numeric parity
+
+The MLX `decode()` matches the reference `timesfm3` PyTorch `decode()` to **max abs error 2.1e-6 /
+mean 4.0e-7** (float32 noise) on a 512→64 forecast. All 445 checkpoint tensors map 1:1 onto the MLX
+parameter tree. The parity test (`tests/test_timesfm.py`) runs against a checkout of the reference
+source when `MLX_TSFM_REF_DIR` is set.
+
+## Benchmarks (real TimesFM-3, Apple M4 Max)
+
+330.7M params, context 512, horizon 64:
+
+| precision | batch=1 p50 | batch=8 | batch=32 | throughput @32 |
+|---|---|---|---|---|
+| fp32 | 20.4 ms | 30.8 ms | 67.4 ms | **475 series/s** |
+| int8 (body) | 19.7 ms | 29.3 ms | 68.6 ms | 467 series/s |
+
+Batching scales throughput near-linearly (49 → 259 → 475 series/s) — the single highest-leverage
+optimization, since TimesFM 3 decodes the whole horizon in one non-autoregressive pass. int8 gives a
+small batch-1 win (weight-memory-bound); the short patch sequence keeps larger batches GEMM-bound.
 
 ## Model support & licensing
 
 | Model | Type | Weights license | Commercial | Status |
 |---|---|---|---|---|
-| `toy` | reference patched transformer (random init) | — | — | **works** (for testing the pipeline) |
-| Chronos-2 (`amazon/chronos-2`) | encoder, quantile | Apache-2.0 | ✅ | **recommended default** — in progress |
-| TimesFM 3.0 (`google/timesfm-3.0-pytorch`) | decoder, patch, 9-quantile | non-commercial | ❌ research only | in progress |
+| TimesFM 3.0 (`google/timesfm-3.0-pytorch`) | decoder, patch, 9-quantile | non-commercial | ❌ research only | **works — MLX-native, parity-verified** |
+| Chronos-2 (`amazon/chronos-2`) | encoder, quantile | Apache-2.0 | ✅ | planned (commercial default) |
 | TimesFM 2.5 / 2.0 | decoder, patch | Apache-2.0 (verify 2.5) | ✅ | planned |
-| Moirai (Salesforce) | encoder, any-variate | CC-BY-NC-4.0 | ❌ | planned |
 
 **mlx-tsfm redistributes no model weights.** Backends convert from the user's own Hugging Face
-download at runtime. TimesFM 3.0 weights are non-commercial and are supported for research only;
-the recommended commercially-clean default is **Chronos-2 (Apache-2.0)**.
-
-## Benchmarks (local)
-
-Measured on an **Apple M4 Max (38 GB)** with a prod-scale `toy` config (`d_model=1024`, 24 layers,
-16 heads, patch 32) — **302.9M params**, context 512, horizon 64, random weights (this measures the
-*inference engineering*, not forecast accuracy):
-
-| precision | batch=1 p50 | batch=8 | batch=32 | batch=32 throughput |
-|---|---|---|---|---|
-| fp32 | 7.95 ms | 12.39 ms | 38.06 ms | **841 series/s** |
-| int8 (body) | **5.06 ms** | 12.02 ms | 37.80 ms | 847 series/s |
-
-Two findings, exactly as predicted: **batching scales throughput near-linearly** (126 → 646 → 841
-series/s), and **int8 helps most at batch 1** (7.95 → 5.06 ms, 1.6×; weight-memory-bound), converging
-with fp32 at large batch (compute-bound). Reproduce:
-
-```bash
-mlx_tsfm.bench --model toy --d-model 1024 --n-layers 24 --n-heads 16 --patch-len 32 \
-               --context 512 --horizon 64 --batch 1,8,32           # add --quantize int8
-```
+download. TimesFM 3.0 weights are **non-commercial (research only)**; a commercially-clean default
+(Chronos-2, Apache-2.0) is on the roadmap.
 
 ## Roadmap
 
 - [x] Model-agnostic core: patching, instance norm, point/quantile heads, `TSFMModel` base + registry, `Forecast`, batching
-- [x] `toy` reference backend — end-to-end forecast on MLX, tested (36 tests)
-- [x] int8 mixed-precision quantization (body int8, heads full-precision) via `mlx.nn.quantize`
-- [x] `bench` (latency/throughput, lazy-eval barriers) + `forecast` CLIs
-- [ ] `convert` (PyTorch → MLX) with per-layer parity gate (<1e-3 vs torch oracle)
-- [ ] Chronos-2 backend (commercial default), then TimesFM 3 (research)
-- [ ] `mx.compile` at fixed shapes; LoRA adapters (milbench-rl format)
+- [x] **TimesFM 3.0 MLX-native backend — real weights, numeric parity verified (2.1e-6)**
+- [x] `convert` (PyTorch → MLX) with a 1:1 tensor-name map; int8 mixed-precision quantization
+- [x] `bench` (lazy-eval-barrier latency/throughput) + `forecast` CLIs
+- [ ] Chronos-2 backend (commercial default) + TimesFM 2.5
+- [ ] `mx.compile` at fixed shapes; multivariate covariates; LoRA adapters (milbench-rl format)
 
 ## License
 

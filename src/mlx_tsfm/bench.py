@@ -73,7 +73,7 @@ def _param_count(model: TSFMModel) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="mlx_tsfm.bench", description="Benchmark TSFM inference.")
-    ap.add_argument("--model", default="toy")
+    ap.add_argument("--model", default="timesfm-3.0")
     ap.add_argument("--context", type=int, default=512)
     ap.add_argument("--horizon", type=int, default=64)
     ap.add_argument("--batch", default="1,8,32", help="comma-separated batch sizes")
@@ -81,21 +81,11 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--json", action="store_true")
-    # toy-scaling passthrough (lets you run a prod-scale config with random weights)
-    ap.add_argument("--d-model", type=int)
-    ap.add_argument("--n-layers", type=int)
-    ap.add_argument("--n-heads", type=int)
-    ap.add_argument("--patch-len", type=int)
     args = ap.parse_args()
 
     from . import load
 
-    cfg = {"horizon_max": max(args.horizon, 64), "context_len": args.context}
-    for k, v in [("d_model", args.d_model), ("n_layers", args.n_layers),
-                 ("n_heads", args.n_heads), ("patch_len", args.patch_len)]:
-        if v is not None:
-            cfg[k] = v
-    model = load(args.model, **cfg)
+    model = load(args.model)
 
     if args.quantize:
         from .quantize import quantize_model

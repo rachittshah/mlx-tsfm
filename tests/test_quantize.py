@@ -8,7 +8,7 @@ from mlx_tsfm.quantize import quantize_model
 
 
 def _m():
-    return load("toy", d_model=64, n_heads=4, n_layers=2, patch_len=16,
+    return load("_stub", d_model=64, n_heads=4, n_layers=2, patch_len=16,
                 horizon_max=32, context_len=128)
 
 
