@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-tsfm"
+version = "0.0.1"
+description = "Time-Series Foundation Model inference on Apple Silicon, built on top of mlx / mlx-lm."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Rachitt Shah" }]
+keywords = ["mlx", "apple-silicon", "time-series", "forecasting", "foundation-model", "timesfm", "chronos"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: MacOS",
+]
+dependencies = [
+  "mlx>=0.32,<0.34",       # aligns with milbench-rl (runs 0.32.1)
+  "mlx-lm>=0.31,<0.33",    # quant / compile / tuner utilities
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# convert path + numeric oracle only (heavy; not needed for MLX inference)
+torch = ["torch>=2.4", "safetensors>=0.4", "huggingface-hub>=0.24"]
+dev = ["pytest>=8", "pre-commit>=3.7"]
+
+[project.scripts]
+"mlx_tsfm.forecast" = "mlx_tsfm.forecast:main"
+"mlx_tsfm.bench" = "mlx_tsfm.bench:main"
+"mlx_tsfm.convert" = "mlx_tsfm.convert:main"
+"mlx_tsfm.quantize" = "mlx_tsfm.quantize:main"
+
+[project.urls]
+Homepage = "https://github.com/rachittshah/mlx-tsfm"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlx_tsfm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
