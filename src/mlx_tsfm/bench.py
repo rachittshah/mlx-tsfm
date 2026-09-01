@@ -78,6 +78,8 @@ def main() -> int:
     ap.add_argument("--horizon", type=int, default=64)
     ap.add_argument("--batch", default="1,8,32", help="comma-separated batch sizes")
     ap.add_argument("--quantize", choices=["int8", "int4"], default=None)
+    ap.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default="fp32")
+    ap.add_argument("--no-compile", action="store_true", help="disable mx.compile")
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--json", action="store_true")
@@ -85,7 +87,7 @@ def main() -> int:
 
     from . import load
 
-    model = load(args.model)
+    model = load(args.model, dtype=args.dtype, compile=not args.no_compile)
 
     if args.quantize:
         from .quantize import quantize_model

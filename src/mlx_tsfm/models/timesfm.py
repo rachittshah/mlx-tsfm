@@ -158,8 +158,7 @@ def _stitch_patches(patch_preds: mx.array, patch_len: int) -> mx.array:
     middles = nxt[:, :, :, overlap:patch_len, :]
     chunks = mx.concatenate([stitched, middles], axis=3).reshape(b, v, (num_patches - 1) * patch_len, q)
     tail = patch_preds[:, :, -1, patch_len:, :]
-    return mx.concatenate([first, mid_and_tail := chunks, tail], axis=2) if False else \
-        mx.concatenate([first, chunks, tail], axis=2)
+    return mx.concatenate([first, chunks, tail], axis=2)
 
 
 # --------------------------------------------------------------------------- config
@@ -177,6 +176,7 @@ class TimesFMConfig:
     use_linear_detrending: bool = True
     linear_detrending_threshold: float = 0.5
     value_clip: float = 1e20
+    use_compile: bool = True   # mx.compile the forward pass (fuses kernels, cuts dispatch overhead)
 
     @property
     def head_dim(self) -> int:
@@ -229,6 +229,10 @@ class _MHA(nn.Module):
 
     def __call__(self, x: mx.array, patch_mask: mx.array) -> mx.array:
         B, N, _ = x.shape
+        # Single-position attention (variate attention with one variate): softmax over a single
+        # key is exactly 1, so the output equals the value projection. Skip Q/K/RoPE/norms/softmax.
+        if N == 1:
+            return self.out_proj(self.value_proj(x))
         h, hd = self.num_heads, self.head_dim
         q = self.query_proj(x).reshape(B, N, h, hd)
         k = self.key_proj(x).reshape(B, N, h, hd)
@@ -307,6 +311,7 @@ class TimesFM3(nn.Module):
                                                        cfg.model_dims)
         self.transformer_stack = _Stack(cfg)
         self.output_head = nn.Linear(cfg.model_dims, cfg.output_patch_len * cfg.num_quantiles, bias=True)
+        self._cdtype = mx.float32   # transformer compute dtype (bf16/fp16 optional; stats stay fp32)
 
     # ---- forward over patched inputs (matches reference forward, target-only path) ----
     def _forward_logits(self, values, masks, patch_is_target, patch_cpm_mask=None):
@@ -322,11 +327,11 @@ class TimesFM3(nn.Module):
         vals_cat = mx.concatenate([vals_norm, vals_fcov], axis=-1)
         masks_cat = mx.concatenate([masks, masks_fcov], axis=-1)
         resblock_in = mx.concatenate([vals_cat, masks_cat.astype(mx.float32)], axis=-1)
-        x = self.pre_transformer_resblock(resblock_in)
+        x = self.pre_transformer_resblock(resblock_in.astype(self._cdtype))
         patch_mask = masks_cat.astype(mx.float32).min(axis=3) > 0.5      # all-masked patch
         eff = mx.cumprod(patch_mask.astype(mx.int32), axis=2) > 0        # leading masked only
         x = self.transformer_stack(x, eff)
-        raw = self.output_head(x)                                        # (b,v,n,64*9), normalized
+        raw = self.output_head(x).astype(mx.float32)                     # (b,v,n,64*9), normalized
         if patch_cpm_mask is not None:
             ref_mu, ref_sigma = _cpm_revin_refine(
                 raw, running_n, mu, sigma, patch_cpm_mask,
@@ -339,6 +344,19 @@ class TimesFM3(nn.Module):
         raw = mx.clip(raw, -cfg.value_clip, cfg.value_clip)
         b, v, n = raw.shape[:3]
         return raw.reshape(b, v, n, cfg.output_patch_len, cfg.num_quantiles)
+
+    def _forward_fn(self):
+        """Return the forward, mx.compiled once (lazily, after weights are loaded).
+
+        Compiling fuses the whole pass (including the unrolled running-stats / CPM-refine loops)
+        into one graph, which removes the per-op and Python-loop dispatch overhead that dominates
+        latency at this model size. MLX recompiles per unique input shape and caches.
+        """
+        if not self.config.use_compile:
+            return self._forward_logits
+        if getattr(self, "_compiled_forward", None) is None:
+            self._compiled_forward = mx.compile(self._forward_logits)
+        return self._compiled_forward
 
     def decode(self, target: mx.array, horizon: int) -> mx.array:
         """target: (b, 1, context) -> logits (b, 1, horizon, num_quantiles). Target-only path."""
@@ -385,7 +403,7 @@ class TimesFM3(nn.Module):
         horizon_cpm = mx.concatenate(
             [mx.zeros((b, num_ctx_patches), dtype=mx.bool_),
              mx.ones((b, num_hor_patches), dtype=mx.bool_)], axis=1)
-        logits = self._forward_logits(values_bvnp, masks_bvnp, patch_is_target, horizon_cpm)
+        logits = self._forward_fn()(values_bvnp, masks_bvnp, patch_is_target, horizon_cpm)
 
         # stitch forecast patches into the horizon
         fidx = mx.arange(num_forecast_patches) + (num_ctx_patches - 1)
@@ -446,10 +464,21 @@ class TimesFM3(nn.Module):
         return self.forecast_batch(_as_2d(context), horizon, quantiles)
 
     @classmethod
-    def from_pretrained(cls, repo="google/timesfm-3.0-pytorch", weights_path=None):
+    def from_pretrained(cls, repo="google/timesfm-3.0-pytorch", weights_path=None,
+                        dtype="fp32", compile=True):
+        """Load real weights. dtype 'bf16'/'fp16' runs the transformer in reduced precision
+        (faster, small accuracy cost); 'fp32' (default) keeps the verified ~1e-6 parity."""
+        from mlx.utils import tree_map
+
         from ..convert import load_timesfm3_weights
-        model = cls()
+
+        model = cls(TimesFMConfig(use_compile=compile))
         load_timesfm3_weights(model, repo=repo, weights_path=weights_path)
+        if dtype in ("bf16", "fp16"):
+            ct = mx.bfloat16 if dtype == "bf16" else mx.float16
+            for sub in (model.pre_transformer_resblock, model.transformer_stack, model.output_head):
+                sub.update(tree_map(lambda p: p.astype(ct), sub.parameters()))
+            model._cdtype = ct
         return model
 
 
