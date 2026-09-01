@@ -81,14 +81,15 @@ def test_numeric_parity_vs_pytorch_reference():
     ref.load_state_dict(load_torch(wp), strict=False)
     ref.eval()
 
-    ctx = np.sin(np.linspace(0, 40, 512)).astype(np.float32)
-    with torch.no_grad():
-        ref_logits = ref.decode(torch.tensor(ctx)[None, None, :], horizon=64).numpy()
-
     from mlx_tsfm.convert import load_timesfm3_weights
 
     m = TimesFM3()
     load_timesfm3_weights(m, weights_path=wp)
-    mine = np.array(m.decode(mx.array(ctx)[None, None, :], 64))
 
-    assert np.abs(ref_logits - mine).max() < 1e-4
+    ctx = np.sin(np.linspace(0, 40, 512)).astype(np.float32)
+    # horizon 64 = single forecast patch; horizon 128 exercises multi-patch + cpm_revin_refine
+    for horizon in (64, 128):
+        with torch.no_grad():
+            ref_logits = ref.decode(torch.tensor(ctx)[None, None, :], horizon=horizon).numpy()
+        mine = np.array(m.decode(mx.array(ctx)[None, None, :], horizon))
+        assert np.abs(ref_logits - mine).max() < 1e-4, f"parity failed at horizon {horizon}"

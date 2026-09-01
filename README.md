@@ -60,10 +60,11 @@ mlx_tsfm.convert  --hf google/timesfm-3.0-pytorch --out models/timesfm-3.0-mlx -
 
 ## Numeric parity
 
-The MLX `decode()` matches the reference `timesfm3` PyTorch `decode()` to **max abs error 2.1e-6 /
-mean 4.0e-7** (float32 noise) on a 512→64 forecast. All 445 checkpoint tensors map 1:1 onto the MLX
-parameter tree. The parity test (`tests/test_timesfm.py`) runs against a checkout of the reference
-source when `MLX_TSFM_REF_DIR` is set.
+The MLX `decode()` matches the reference `timesfm3` PyTorch `decode()` to **~1e-6 max abs error**
+(float32 noise) across horizons 24–512 — including the multi-patch path with iterative CPM RevIN
+refinement — on multiple signals. All 445 checkpoint tensors map 1:1 onto the MLX parameter tree.
+The parity test (`tests/test_timesfm.py`) runs against a checkout of the reference source when
+`MLX_TSFM_REF_DIR` is set.
 
 ## Benchmarks (real TimesFM-3, Apple M4 Max)
 

@@ -69,35 +69,64 @@ def _revin(x: mx.array, mu: mx.array, sigma: mx.array, reverse: bool = False) ->
     return (x - mu) / safe_sigma
 
 
+def _update_running_stats(n, mu, sigma, x, mask):
+    """Welford-style merge of a patch (x, mask) into running (n, mu, sigma). Shapes (b,v) / (b,v,p)."""
+    legit = ~mask
+    inc_n = legit.astype(mx.float32).sum(axis=-1)
+    safe_inc_n = mx.where(inc_n == 0, 1.0, inc_n)
+    inc_sum = mx.where(legit, x, 0.0).sum(axis=-1)
+    inc_mu = mx.where(inc_n == 0, 0.0, inc_sum / safe_inc_n)
+    diff_sq = mx.where(legit, (x - inc_mu[..., None]) ** 2, 0.0)
+    inc_var = mx.where(inc_n == 0, 0.0, diff_sq.sum(axis=-1) / safe_inc_n)
+    inc_sigma = mx.sqrt(inc_var)
+    new_n = n + inc_n
+    safe_new_n = mx.where(new_n == 0, 1.0, new_n)
+    new_mu = mx.where(new_n == 0, 0.0, (n * mu + inc_mu * inc_n) / safe_new_n)
+    new_var = mx.where(
+        new_n == 0, 0.0,
+        (n * sigma * sigma + inc_n * inc_sigma * inc_sigma
+         + n * (mu - new_mu) ** 2 + inc_n * (inc_mu - new_mu) ** 2) / safe_new_n,
+    )
+    return new_n, new_mu, mx.sqrt(new_var)
+
+
 def _get_running_stats(values: mx.array, masks: mx.array):
     """Cumulative causal running (n, mean, std) per patch. values/masks: (b, v, n, p)."""
     b, v, n, _ = values.shape
-    cur_n = mx.zeros((b, v))
-    cur_mu = mx.zeros((b, v))
-    cur_sigma = mx.zeros((b, v))
+    cur = (mx.zeros((b, v)), mx.zeros((b, v)), mx.zeros((b, v)))
     out_n, out_mu, out_sigma = [], [], []
     for i in range(n):
-        x = values[:, :, i, :]
-        m = masks[:, :, i, :]
-        legit = (~m).astype(mx.float32)
-        inc_n = legit.sum(axis=-1)
-        x_masked = mx.where(~m, x, 0.0)
-        inc_sum = x_masked.sum(axis=-1)
-        inc_mu = mx.where(inc_n == 0, 0.0, inc_sum / mx.where(inc_n == 0, 1.0, inc_n))
-        diff_sq = mx.where(~m, (x - inc_mu[..., None]) ** 2, 0.0)
-        inc_var = mx.where(inc_n == 0, 0.0, diff_sq.sum(axis=-1) / mx.where(inc_n == 0, 1.0, inc_n))
-        inc_sigma = mx.sqrt(inc_var)
-        new_n = cur_n + inc_n
-        safe_new_n = mx.where(new_n == 0, 1.0, new_n)
-        new_mu = mx.where(new_n == 0, 0.0, (cur_n * cur_mu + inc_mu * inc_n) / safe_new_n)
-        new_var = mx.where(
-            new_n == 0, 0.0,
-            (cur_n * cur_sigma * cur_sigma + inc_n * inc_sigma * inc_sigma
-             + cur_n * (cur_mu - new_mu) ** 2 + inc_n * (inc_mu - new_mu) ** 2) / safe_new_n,
-        )
-        cur_n, cur_mu, cur_sigma = new_n, new_mu, mx.sqrt(new_var)
-        out_n.append(cur_n); out_mu.append(cur_mu); out_sigma.append(cur_sigma)
+        cur = _update_running_stats(*cur, values[:, :, i, :], masks[:, :, i, :])
+        out_n.append(cur[0]); out_mu.append(cur[1]); out_sigma.append(cur[2])
     return mx.stack(out_n, axis=2), mx.stack(out_mu, axis=2), mx.stack(out_sigma, axis=2)
+
+
+def _cpm_revin_refine(raw_logits, revin_n, revin_mu, revin_sigma, patch_cpm_mask,
+                      median_q_idx, rolls, patch_len, num_quantiles, value_clip):
+    """Iterative RevIN refinement at CPM (horizon) patches — matches the reference decode()."""
+    b, v, n, _ = raw_logits.shape
+    median = raw_logits.reshape(b, v, n, rolls, patch_len, num_quantiles)[:, :, :, :, :, median_q_idx]
+    carry = (mx.zeros((b, v)), mx.zeros((b, v)), mx.zeros((b, v)))
+    anchor = mx.zeros((b, v, rolls, patch_len))
+    block_offset = mx.zeros((b,), dtype=mx.int32)
+    step_masks = mx.zeros((b, v, patch_len), dtype=mx.bool_)
+    ref_mu, ref_sigma = [], []
+    for i in range(n):
+        is_cpm = patch_cpm_mask[:, i:i + 1]                                   # (b,1)
+        onehot = (mx.arange(rolls)[None, :] == block_offset[:, None]).astype(mx.float32)
+        predicted_step = (onehot[:, None, :, None] * anchor).sum(axis=2)      # (b,v,p)
+        new_n, new_mu, new_sigma = _update_running_stats(*carry, predicted_step, step_masks)
+        out_n = mx.where(is_cpm, new_n, revin_n[:, :, i])
+        out_mu = mx.where(is_cpm, new_mu, revin_mu[:, :, i])
+        out_sigma = mx.where(is_cpm, new_sigma, revin_sigma[:, :, i])
+        new_block_offset = mx.where(is_cpm[:, 0], (block_offset + 1) % rolls, mx.zeros_like(block_offset))
+        should_update = (new_block_offset == 0)[:, None, None, None]
+        step_pred = mx.clip(_revin(median[:, :, i], out_mu, out_sigma, reverse=True), -value_clip, value_clip)
+        anchor = mx.where(should_update, step_pred, anchor)
+        carry = (out_n, out_mu, out_sigma)
+        block_offset = new_block_offset
+        ref_mu.append(out_mu); ref_sigma.append(out_sigma)
+    return mx.stack(ref_mu, axis=2), mx.stack(ref_sigma, axis=2)
 
 
 def _output_patch_via_roll(x: mx.array, rolls: int):
@@ -280,7 +309,7 @@ class TimesFM3(nn.Module):
         self.output_head = nn.Linear(cfg.model_dims, cfg.output_patch_len * cfg.num_quantiles, bias=True)
 
     # ---- forward over patched inputs (matches reference forward, target-only path) ----
-    def _forward_logits(self, values, masks, patch_is_target):
+    def _forward_logits(self, values, masks, patch_is_target, patch_cpm_mask=None):
         cfg = self.config
         running_n, mu, sigma = _get_running_stats(values, masks)
         vals_norm = _revin(values, mu, sigma)
@@ -297,7 +326,15 @@ class TimesFM3(nn.Module):
         patch_mask = masks_cat.astype(mx.float32).min(axis=3) > 0.5      # all-masked patch
         eff = mx.cumprod(patch_mask.astype(mx.int32), axis=2) > 0        # leading masked only
         x = self.transformer_stack(x, eff)
-        raw = self.output_head(x)                                        # (b,v,n,64*9)
+        raw = self.output_head(x)                                        # (b,v,n,64*9), normalized
+        if patch_cpm_mask is not None:
+            ref_mu, ref_sigma = _cpm_revin_refine(
+                raw, running_n, mu, sigma, patch_cpm_mask,
+                cfg.num_quantiles // 2, cfg.rolls, cfg.input_patch_len,
+                cfg.num_quantiles, cfg.value_clip)
+            cpm = patch_cpm_mask[:, None, :]                             # (b,1,n)
+            mu = mx.where(cpm, ref_mu, mu)
+            sigma = mx.where(cpm, ref_sigma, sigma)
         raw = _revin(raw, mu, sigma, reverse=True)
         raw = mx.clip(raw, -cfg.value_clip, cfg.value_clip)
         b, v, n = raw.shape[:3]
@@ -344,7 +381,11 @@ class TimesFM3(nn.Module):
         masks_bvnp = all_masks.reshape(b, num_target, n_tot, p)
         patch_is_target = mx.ones((b, num_target, n_tot), dtype=mx.bool_)
 
-        logits = self._forward_logits(values_bvnp, masks_bvnp, patch_is_target)
+        # horizon CPM mask: context patches False, horizon patches True
+        horizon_cpm = mx.concatenate(
+            [mx.zeros((b, num_ctx_patches), dtype=mx.bool_),
+             mx.ones((b, num_hor_patches), dtype=mx.bool_)], axis=1)
+        logits = self._forward_logits(values_bvnp, masks_bvnp, patch_is_target, horizon_cpm)
 
         # stitch forecast patches into the horizon
         fidx = mx.arange(num_forecast_patches) + (num_ctx_patches - 1)
