@@ -1,0 +1,19 @@
+mlx-tsfm
+Copyright (c) 2026 Rachitt Shah
+
+This product includes software derived from TimesFM
+(https://github.com/google-research/timesfm), Copyright Google LLC, licensed
+under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+The MLX implementation in `src/mlx_tsfm/models/timesfm.py` is a port/translation
+of the reference `timesfm3` PyTorch implementation from that project. The model
+architecture and algorithms (patch featurization, iterative running-stats RevIN,
+linear detrending, RoPE, per-dim-scale QK-norm attention, sequence + variate
+mixing, patch stitching, and CPM RevIN refinement) originate there.
+
+Changes made: reimplemented in Apple MLX for inference on Apple Silicon;
+numerically verified against the reference implementation (max abs error ~1e-6).
+
+TimesFM model weights (e.g. google/timesfm-3.0-pytorch) are distributed by Google
+under a separate, non-commercial license and are NOT included in or redistributed
+by this repository; they are downloaded by the user at runtime.

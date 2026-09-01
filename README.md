@@ -100,6 +100,11 @@ download. TimesFM 3.0 weights are **non-commercial (research only)**; a commerci
 - [ ] Chronos-2 backend (commercial default) + TimesFM 2.5
 - [ ] `mx.compile` at fixed shapes; multivariate covariates; LoRA adapters (milbench-rl format)
 
-## License
+## License & attribution
 
 MIT (code). Model weights retain their own licenses (see table above).
+
+`src/mlx_tsfm/models/timesfm.py` is an MLX port of the reference
+[`timesfm`](https://github.com/google-research/timesfm) implementation (Copyright Google LLC,
+Apache-2.0). See [`NOTICE`](NOTICE). Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md);
+upstreaming plans are in [`docs/UPSTREAM.md`](docs/UPSTREAM.md).
