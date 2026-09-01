@@ -60,6 +60,22 @@ def test_real_weights_load_and_forecast():
     assert not bool(mx.isnan(fc.point).any().item())
 
 
+@pytest.mark.skipif(_cached_weights() is None, reason="TimesFM-3 weights not cached locally")
+def test_compiled_matches_uncompiled():
+    """The mx.compile + v=1 fast-path optimizations must not change the output."""
+    from mlx_tsfm.convert import load_timesfm3_weights
+    from mlx_tsfm.models.timesfm import TimesFMConfig
+
+    ctx = np.sin(np.linspace(0, 30, 400)).astype(np.float32)[None, None, :]
+    m_c = TimesFM3()                                       # use_compile=True (default)
+    load_timesfm3_weights(m_c, weights_path=_cached_weights())
+    m_u = TimesFM3(TimesFMConfig(use_compile=False))
+    load_timesfm3_weights(m_u, weights_path=_cached_weights())
+    a = np.array(m_c.decode(mx.array(ctx), 96))
+    b = np.array(m_u.decode(mx.array(ctx), 96))
+    assert np.abs(a - b).max() < 1e-5
+
+
 @pytest.mark.skipif(
     _cached_weights() is None or not os.environ.get("MLX_TSFM_REF_DIR"),
     reason="needs cached weights and MLX_TSFM_REF_DIR pointing at the reference timesfm3 source",

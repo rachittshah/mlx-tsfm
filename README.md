@@ -68,16 +68,23 @@ The parity test (`tests/test_timesfm.py`) runs against a checkout of the referen
 
 ## Benchmarks (real TimesFM-3, Apple M4 Max)
 
-330.7M params, context 512, horizon 64:
+330.7M params, context 512, horizon 64. Default config is fp32 + `mx.compile` (parity-exact):
 
-| precision | batch=1 p50 | batch=8 | batch=32 | throughput @32 |
+| config | batch=1 p50 | batch=8 | batch=32 | throughput @32 |
 |---|---|---|---|---|
-| fp32 | 20.4 ms | 30.8 ms | 67.4 ms | **475 series/s** |
-| int8 (body) | 19.7 ms | 29.3 ms | 68.6 ms | 467 series/s |
+| fp32, no compile | 23.8 ms | 34.3 ms | 71.7 ms | 447 series/s |
+| **fp32 + compile (default)** | **12.5 ms** | **21.1 ms** | **49.9 ms** | **641 series/s** |
+| bf16 + compile | 18.5 ms | 27.8 ms | 55.9 ms | 573 series/s |
+| int8 + compile | 13.3 ms | 24.1 ms | 52.3 ms | 612 series/s |
 
-Batching scales throughput near-linearly (49 → 259 → 475 series/s) — the single highest-leverage
-optimization, since TimesFM 3 decodes the whole horizon in one non-autoregressive pass. int8 gives a
-small batch-1 win (weight-memory-bound); the short patch sequence keeps larger batches GEMM-bound.
+The ~1.9x batch-1 speedup is from `mx.compile` (kernel fusion plus removing the per-op and
+Python-loop dispatch) and a variate-attention fast path (softmax over one variate is exactly 1, so it
+reduces to a value projection). Both are exact: parity vs the PyTorch reference stays ~1e-6.
+
+The reduced-precision rows being slower is the interesting part. TimesFM 3's patch sequence is short
+(~18 tokens), so inference is dispatch-bound, not compute- or bandwidth-bound. `mx.compile` fixes the
+real bottleneck; bf16 and int8 only add cast/dequant overhead. They stay available (`--dtype`,
+`--quantize`) and may help at much longer contexts, but fp32 + compile is fastest for typical use.
 
 ## Model support & licensing
 
@@ -98,7 +105,8 @@ download. TimesFM 3.0 weights are **non-commercial (research only)**; a commerci
 - [x] `convert` (PyTorch → MLX) with a 1:1 tensor-name map; int8 mixed-precision quantization
 - [x] `bench` (lazy-eval-barrier latency/throughput) + `forecast` CLIs
 - [ ] Chronos-2 backend (commercial default) + TimesFM 2.5
-- [ ] `mx.compile` at fixed shapes; multivariate covariates; LoRA adapters (milbench-rl format)
+- [x] `mx.compile` forward + variate-attention fast path (~1.9x batch-1, parity-exact)
+- [ ] multivariate covariates; LoRA adapters (milbench-rl format)
 
 ## License & attribution
 
